@@ -1,0 +1,13 @@
+[project]
+name = "ses-matcher"
+version = "0.1.0"
+description = "SES案件自動取込・マッチング・応募メール生成システム"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "streamlit>=1.40.0",
+    "python-dotenv>=1.0.0",
+]
+
+[tool.uv]
+dev-dependencies = []
