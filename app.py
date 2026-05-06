@@ -5,13 +5,14 @@ app.py - SES案件管理 Streamlit UI
     uv run streamlit run app.py
 """
 import json
-import subprocess
-import sys
+import io
+import contextlib
 from datetime import datetime
 
 import streamlit as st
 import db
 from mail_composer import generate_application_mail
+from fetch_mails import run as fetch_run
 
 # ──────────────────────────────────────
 # ページ設定
@@ -47,17 +48,18 @@ with st.sidebar:
     st.header("🔄 メール取込")
     days = st.number_input("取込日数", min_value=1, max_value=90, value=7)
     if st.button("今すぐ取込実行", type="primary", use_container_width=True):
-        with st.spinner("メールを取込中..."):
-            result = subprocess.run(
-                [sys.executable, "-m", "uv", "run", "fetch_mails.py", "--days", str(days)],
-                capture_output=True, text=True,
-            )
-            st.text(result.stdout[-1000:] if result.stdout else "（出力なし）")
-            if result.returncode == 0:
-                st.success("取込完了！")
+        log_area = st.empty()
+        with st.spinner("メールを取込中... (Thunderbird起動中であること)"):
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    new_count, skip_count, error_count = fetch_run(days)
+                log_area.text(buf.getvalue()[-1500:])
+                st.success(f"取込完了！ 新規:{new_count} スキップ:{skip_count} エラー:{error_count}")
                 st.rerun()
-            else:
-                st.error(f"エラー: {result.stderr[-500:]}")
+            except Exception as e:
+                log_area.text(buf.getvalue()[-1500:])
+                st.error(f"エラー: {e}")
 
 # ──────────────────────────────────────
 # 案件一覧
@@ -109,8 +111,17 @@ for job in jobs:
         col_title, col_badge, col_btn = st.columns([5, 2, 1])
         with col_title:
             title = job.get("job_name") or job.get("subject", "（案件名不明）")
-            st.markdown(f"**{title[:60]}**")
+            received = job.get("received_at", "")
+            date_str = received[:10] if received else ""
+            st.markdown(
+                f"**{title[:60]}**"
+                f"<span style='font-size:12px;color:gray;font-weight:normal;"
+                f"margin-left:8px;'>{date_str}</span>",
+                unsafe_allow_html=True,
+            )
             meta_parts = []
+            if job.get("sender_name"):
+                meta_parts.append(f"✉️{job['sender_name']}")
             if job.get("location"):
                 meta_parts.append(f"📍{job['location']}")
             if job.get("remote_type"):
