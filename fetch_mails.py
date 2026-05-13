@@ -36,6 +36,8 @@ from dotenv import load_dotenv
 
 import db
 
+sys.stdout.reconfigure(encoding='utf-8')
+
 load_dotenv()
 
 # ───────────────────────────────────────
@@ -48,6 +50,8 @@ FETCH_DAYS        = int(os.environ.get("FETCH_DAYS_BACK", "7"))
 TARGET_FOLDER_URIS = [
     "imap://m-fujii%40iroha-keikaku.com@mail.iroha-keikaku.com/INBOX",
     "imap://m-fujii%40iroha-keikaku.com@mail.iroha-keikaku.com/INBOX/[office] ",
+    "imap://m-fujii%40iroha-keikaku.com@mail.iroha-keikaku.com/INBOX/N&MPswuDCnMPM-",
+    "imap://m-fujii%40iroha-keikaku.com@mail.iroha-keikaku.com/INBOX/&MKIwtTCkMPMwyjDT-",
 ]
 
 # ───────────────────────────────────────
@@ -106,12 +110,15 @@ class ThunderbirdMCPClient:
         return data.get("result", {})
 
     def get_recent_messages(self, folder_uri: str, days_back: int) -> list[dict]:
+        start_date = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
         result = self.call("tools/call", {
-            "name":      "getRecentMessages",
+            "name":      "searchMessages",
             "arguments": {
-                "folderPath": folder_uri,
-                "daysBack":   days_back,
-                "maxResults": 200,
+                "query":             "",
+                "folderPath":        folder_uri,
+                "startDate":         start_date,
+                "maxResults":        200,
+                "includeSubfolders": False,
             },
         })
         # result は {"content": [{"type":"text","text":"[...]"}]} の形
@@ -126,7 +133,23 @@ class ThunderbirdMCPClient:
                 "bodyFormat": "text",
             },
         })
-        return _parse_tool_result(result)
+        parsed = _parse_tool_result(result)
+        # bodyが空の場合はHTML形式でリトライ
+        if isinstance(parsed, dict) and not parsed.get("body", "").strip():
+            result2 = self.call("tools/call", {
+                "name":      "getMessage",
+                "arguments": {
+                    "folderPath": folder_uri,
+                    "messageId":  message_id,
+                    "bodyFormat": "html",
+                },
+            })
+            parsed2 = _parse_tool_result(result2)
+            if isinstance(parsed2, dict) and parsed2.get("body", "").strip():
+                import re as _re
+                parsed2["body"] = _re.sub(r"<[^>]+>", " ", parsed2["body"])
+                return parsed2
+        return parsed
 
 
 def _parse_tool_result(result) -> dict | list:
@@ -162,7 +185,7 @@ def fetch_messages(days_back: int) -> list[dict]:
         try:
             headers = client.get_recent_messages(folder_uri, days_back)
         except Exception as e:
-            print(f"[fetch]   getRecentMessages エラー: {e}")
+            print(f"[fetch]   searchMessages エラー: {e}")
             continue
 
         if not isinstance(headers, list):
@@ -231,7 +254,7 @@ def is_job_mail(subject: str, body: str) -> bool:
             return False
 
     keywords = [
-        "案件", "エンジニア募集", "Java", "SpringBoot",
+        "案件", "エンジニア募集", "Java", "SpringBoot", "springboot", "spring",
         "必須", "尚可", "単価", "面談",
     ]
     text = subject + body
