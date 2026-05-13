@@ -79,6 +79,38 @@ col4.metric("応募済", sum(1 for j in all_jobs if j["status"] == "applied"))
 
 st.divider()
 
+# 検索 & ソート
+col_search, col_sort = st.columns([4, 1])
+with col_search:
+    search_query = st.text_input(
+        "案件名・件名で検索",
+        placeholder="キーワードを入力...",
+        label_visibility="collapsed",
+    )
+with col_sort:
+    if "sort_order" not in st.session_state:
+        st.session_state["sort_order"] = "desc"
+    sort_label = "新しい順 ↓" if st.session_state["sort_order"] == "desc" else "古い順 ↑"
+    if st.button(sort_label, use_container_width=True):
+        st.session_state["sort_order"] = "asc" if st.session_state["sort_order"] == "desc" else "desc"
+        st.rerun()
+
+# 検索フィルタ（job_name と subject の両方を対象）
+if search_query:
+    q = search_query.lower()
+    jobs = [
+        j for j in jobs
+        if q in (j.get("job_name") or "").lower()
+        or q in (j.get("subject") or "").lower()
+    ]
+
+# ソート
+jobs = sorted(
+    jobs,
+    key=lambda j: j.get("received_at") or "",
+    reverse=(st.session_state["sort_order"] == "desc"),
+)
+
 if not jobs:
     st.info("表示できる案件がありません。メールを取込んでください。")
     st.stop()
