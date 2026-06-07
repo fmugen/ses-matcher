@@ -49,7 +49,7 @@ with st.sidebar:
     days = st.number_input("取込日数", min_value=1, max_value=90, value=7)
     if st.button("今すぐ取込実行", type="primary", use_container_width=True):
         log_area = st.empty()
-        with st.spinner("メールを取込中... (Thunderbird起動中であること)"):
+        with st.spinner("メールを取込中..."):
             buf = io.StringIO()
             try:
                 with contextlib.redirect_stdout(buf):

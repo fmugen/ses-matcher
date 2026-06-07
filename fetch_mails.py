@@ -1,24 +1,23 @@
 """
-fetch_mails.py - Thunderbird MCP (HTTP) -> Claude API解析 -> SQLite保存
+fetch_mails.py - 案件メールAPI -> Claude API解析 -> SQLite保存
 
 【仕組み】
-Thunderbird MCP拡張が localhost:8765 でHTTPサーバーを起動している。
-接続情報（port/token）は %TEMP%/thunderbird-mcp/connection.json に書かれる。
-PythonからHTTP POSTで直接JSON-RPC呼び出しが可能。
+社内の「案件メールシステム」が公開しているWeb API
+(https://www.iroha-keikaku.com/system/anken_mail_sys/public/api) から
+日付範囲を指定してメールを検索・取得する。
+認証は事前共有のアクセストークンによるBearer認証。
 
 実行方法:
     uv run fetch_mails.py              # 過去7日分
     uv run fetch_mails.py --days 30    # 過去30日分
 
 前提:
-    - Thunderbird が起動中であること（HTTPサーバーが立ち上がる）
-    - ANTHROPIC_API_KEY を .env に設定済みであること
+    - ANKEN_MAIL_API_TOKEN, ANTHROPIC_API_KEY を .env に設定済みであること
 
 定期実行（Windowsタスクスケジューラ）:
     プログラム: uv.exe のフルパス
     引数:       run python fetch_mails.py
     開始場所:   C:\\path\\to\\ses-matcher
-    ※ Thunderbird が起動している時間帯に実行すること
 """
 
 import argparse
@@ -26,9 +25,8 @@ import json
 import os
 import re
 import sys
-import tempfile
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Iterator
 
 import anthropic
 import httpx
@@ -43,130 +41,121 @@ load_dotenv()
 # ───────────────────────────────────────
 # 設定
 # ───────────────────────────────────────
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-FETCH_DAYS        = int(os.environ.get("FETCH_DAYS_BACK", "7"))
+ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+FETCH_DAYS         = int(os.environ.get("FETCH_DAYS_BACK", "7"))
 
-# 取込対象フォルダ URI（listFolders で確認した値）
-TARGET_FOLDER_URIS = [
-    "imap://m-fujii%40iroha-keikaku.com@mail.iroha-keikaku.com/INBOX",
-    "imap://m-fujii%40iroha-keikaku.com@mail.iroha-keikaku.com/INBOX/[office] ",
-    "imap://m-fujii%40iroha-keikaku.com@mail.iroha-keikaku.com/INBOX/N&MPswuDCnMPM-",
-    "imap://m-fujii%40iroha-keikaku.com@mail.iroha-keikaku.com/INBOX/&MKIwtTCkMPMwyjDT-",
+ANKEN_MAIL_API_BASE_URL = "https://www.iroha-keikaku.com/system/anken_mail_sys/public/api"
+ANKEN_MAIL_API_TOKEN    = os.environ.get("ANKEN_MAIL_API_TOKEN", "")
+
+# 検索APIは「総件数100件超」だとHTTP 400になるため、日単位に区切って取得する
+SEARCH_PAGE_LIMIT = 100
+
+# 要員紹介メール（案件ではなく人材売込み）を件名から除外するためのパターン
+# 検索APIの exclude パラメータ（件名一致で除外）にもそのまま渡し、取得件数自体を絞り込む
+EXCLUDE_SUBJECT_PATTERNS = [
+    "要員のご紹介", "ご紹介です！", "人材のご紹介",
+    "経歴書（スキルシート）", "スキルシート添付", "ご送付依頼",
+]
+
+# 案件メール判定キーワード（subject+bodyに2件以上含まれていれば案件メールとみなす）
+JOB_KEYWORDS = [
+    "案件", "エンジニア募集", "Java", "SpringBoot", "springboot", "spring",
+    "必須", "尚可", "単価", "面談",
 ]
 
 # ───────────────────────────────────────
-# Thunderbird MCP HTTP クライアント
+# 案件メールAPI クライアント
 # ───────────────────────────────────────
 
-def load_mcp_connection() -> tuple[int, str]:
-    """
-    %TEMP%/thunderbird-mcp/connection.json からポートとトークンを読む。
-    Thunderbird 起動時に拡張が自動生成するファイル。
-    """
-    conn_path = Path(tempfile.gettempdir()) / "thunderbird-mcp" / "connection.json"
-    if not conn_path.exists():
-        raise FileNotFoundError(
-            f"connection.json が見つかりません: {conn_path}\n"
-            "Thunderbird が起動中か確認してください。"
-        )
-    data = json.loads(conn_path.read_text(encoding="utf-8"))
-    port  = data.get("port", 8765)
-    token = data.get("token", "")
-    if not token:
-        raise ValueError("connection.json にトークンがありません。")
-    return port, token
-
-
-class ThunderbirdMCPClient:
+class AnkenMailAPIClient:
     def __init__(self):
-        self.port, self.token = load_mcp_connection()
-        self.base_url = f"http://127.0.0.1:{self.port}"
+        if not ANKEN_MAIL_API_TOKEN:
+            raise ValueError("ANKEN_MAIL_API_TOKEN が未設定です。.env を確認してください。")
+        self.base_url = ANKEN_MAIL_API_BASE_URL
         self.headers  = {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {ANKEN_MAIL_API_TOKEN}",
+            "Accept":        "application/json",
         }
-        self._req_id = 0
-        print(f"[mcp] Thunderbird MCP 接続: port={self.port}")
+        print(f"[api] 案件メールAPI接続: {self.base_url}")
 
-    def call(self, method: str, params: dict) -> dict:
-        """JSON-RPC 2.0 呼び出し"""
-        self._req_id += 1
-        payload = {
-            "jsonrpc": "2.0",
-            "id":      self._req_id,
-            "method":  method,
-            "params":  params,
-        }
-        resp = httpx.post(
-            self.base_url,
+    def _get(self, path: str, params: dict) -> dict:
+        resp = httpx.get(
+            f"{self.base_url}/{path}",
             headers=self.headers,
-            json=payload,
+            params=params,
             timeout=30,
         )
         resp.raise_for_status()
         data = resp.json()
-        if "error" in data:
-            raise RuntimeError(f"MCP error: {data['error']}")
-        return data.get("result", {})
+        if data.get("status") != "success":
+            raise RuntimeError(f"API error: {data}")
+        return data
 
-    def get_recent_messages(self, folder_uri: str, days_back: int) -> list[dict]:
-        start_date = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
-        result = self.call("tools/call", {
-            "name":      "searchMessages",
-            "arguments": {
-                "query":             "",
-                "folderPath":        folder_uri,
-                "startDate":         start_date,
-                "maxResults":        200,
-                "includeSubfolders": False,
-            },
+    def search(self, date_from: str, date_to: str, offset: int = 0, limit: int = SEARCH_PAGE_LIMIT) -> dict:
+        """メール一覧検索API (/search.php)"""
+        return self._get("search.php", {
+            "date_from": date_from,
+            "date_to":   date_to,
+            "exclude":   ",".join(EXCLUDE_SUBJECT_PATTERNS),
+            "limit":     limit,
+            "offset":    offset,
         })
-        # result は {"content": [{"type":"text","text":"[...]"}]} の形
-        return _parse_tool_result(result)
 
-    def get_message(self, folder_uri: str, message_id: str) -> dict:
-        result = self.call("tools/call", {
-            "name":      "getMessage",
-            "arguments": {
-                "folderPath": folder_uri,
-                "messageId":  message_id,
-                "bodyFormat": "text",
-            },
-        })
-        parsed = _parse_tool_result(result)
-        # bodyが空の場合はHTML形式でリトライ
-        if isinstance(parsed, dict) and not parsed.get("body", "").strip():
-            result2 = self.call("tools/call", {
-                "name":      "getMessage",
-                "arguments": {
-                    "folderPath": folder_uri,
-                    "messageId":  message_id,
-                    "bodyFormat": "html",
-                },
-            })
-            parsed2 = _parse_tool_result(result2)
-            if isinstance(parsed2, dict) and parsed2.get("body", "").strip():
-                import re as _re
-                parsed2["body"] = _re.sub(r"<[^>]+>", " ", parsed2["body"])
-                return parsed2
-        return parsed
+    def search_all(self, date_from: str, date_to: str) -> list[dict]:
+        """
+        指定期間のメール一覧をすべて取得する。
+        「総件数が100件を超えるとHTTP 400」という制約があるため、
+        まず期間全体で検索を試み、400が返ってきた場合は1日単位に分割して取得する。
+        """
+        try:
+            first = self.search(date_from, date_to)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 400 and date_from != date_to:
+                print(f"[fetch]   {date_from}〜{date_to}: 100件超のため日単位に分割して再取得します")
+                items: list[dict] = []
+                for day in _iter_dates(date_from, date_to):
+                    items.extend(self.search_all(day, day))
+                return _dedupe_by_id(items)
+            if e.response.status_code == 400:
+                print(f"[fetch]   {date_from}: 該当件数が100件を超えるためスキップします（絞り込みが必要です）")
+                return []
+            raise
+
+        items = list(first.get("data", []))
+        total = first.get("total_count", len(items))
+        offset = len(items)
+        while offset < total:
+            page = self.search(date_from, date_to, offset=offset)
+            page_items = page.get("data", [])
+            if not page_items:
+                break
+            items.extend(page_items)
+            offset += len(page_items)
+        return items
+
+    def get_detail(self, mail_id: int) -> dict:
+        """メール詳細取得API (/mail_detail.php)"""
+        data = self._get("mail_detail.php", {"id": mail_id})
+        return data.get("data", {})
 
 
-def _parse_tool_result(result) -> dict | list:
-    """tools/call の返却値からコンテンツを取り出す"""
-    if isinstance(result, (dict, list)):
-        # すでにパース済みの場合
-        if isinstance(result, list):
-            return result
-        # {"content": [{"type":"text","text":"..."}]} 形式
-        content = result.get("content", [])
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                try:
-                    return json.loads(block["text"])
-                except json.JSONDecodeError:
-                    return {"raw": block["text"]}
-    return {}
+def _iter_dates(date_from: str, date_to: str) -> Iterator[str]:
+    d   = datetime.strptime(date_from, "%Y-%m-%d").date()
+    end = datetime.strptime(date_to, "%Y-%m-%d").date()
+    while d <= end:
+        yield d.strftime("%Y-%m-%d")
+        d += timedelta(days=1)
+
+
+def _dedupe_by_id(items: list[dict]) -> list[dict]:
+    seen: set = set()
+    result = []
+    for item in items:
+        mid = item.get("id")
+        if mid not in seen:
+            seen.add(mid)
+            result.append(item)
+    return result
 
 
 # ───────────────────────────────────────
@@ -174,62 +163,62 @@ def _parse_tool_result(result) -> dict | list:
 # ───────────────────────────────────────
 
 def fetch_messages(days_back: int) -> list[dict]:
-    client = ThunderbirdMCPClient()
+    client = AnkenMailAPIClient()
     messages = []
     seen_subjects: set[str] = set()  # 今回実行内での件名重複排除用
 
-    for folder_uri in TARGET_FOLDER_URIS:
-        folder_name = folder_uri.split("/")[-1].strip()
-        print(f"[fetch] フォルダ: {folder_name}")
+    date_to   = datetime.now().strftime("%Y-%m-%d")
+    date_from = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    print(f"[fetch] 検索期間: {date_from} 〜 {date_to}")
 
-        try:
-            headers = client.get_recent_messages(folder_uri, days_back)
-        except Exception as e:
-            print(f"[fetch]   searchMessages エラー: {e}")
+    try:
+        items = client.search_all(date_from, date_to)
+    except Exception as e:
+        print(f"[fetch]   検索APIエラー: {e}")
+        return messages
+
+    print(f"[fetch]   {len(items)}件")
+
+    for item in items:
+        # APIのメールID（システム内一意）をそのまま重複排除キーとして利用する
+        message_id = str(item.get("id", ""))
+        subject    = item.get("subject", "")
+
+        # 一覧APIは本文を含まない（メタデータのみ）ため、件名だけで判定できる
+        # 「要員紹介メール」を先に除外し、詳細取得コストを節約する
+        # （検索APIの exclude パラメータでもサーバー側で大半は絞り込み済み）
+        if is_excluded_subject(subject):
             continue
 
-        if not isinstance(headers, list):
-            headers = headers.get("messages", []) if isinstance(headers, dict) else []
+        # message_id の重複チェック（DB照合）
+        if db.is_duplicate(message_id):
+            continue
 
-        print(f"[fetch]   {len(headers)}件")
+        # 正規化件名の重複チェック（転送・ML転送による同一案件を除外）
+        norm = normalize_subject(subject)
+        if norm in seen_subjects:
+            print(f"[fetch]   重複スキップ（転送）: {subject[:50]}")
+            continue
+        seen_subjects.add(norm)
 
-        for h in headers:
-            msg_id  = h.get("id", "")
-            subject = h.get("subject", "")
-            preview = h.get("preview", "")
+        try:
+            detail = client.get_detail(item["id"])
+        except Exception as e:
+            print(f"[fetch]   詳細取得エラー (id={message_id}): {e}")
+            continue
 
-            # プレビューで先にフィルタ（本文取得コストを節約）
-            if not is_job_mail(subject, preview):
-                continue
+        body = detail.get("body_text", "")
+        if not is_job_mail(subject, body):
+            continue
 
-            # message_id の重複チェック（DB照合）
-            if db.is_duplicate(msg_id):
-                continue
-
-            # 正規化件名の重複チェック（転送・ML転送による同一案件を除外）
-            norm = normalize_subject(subject)
-            if norm in seen_subjects:
-                print(f"[fetch]   重複スキップ（転送）: {subject[:50]}")
-                continue
-            seen_subjects.add(norm)
-
-            try:
-                detail = client.get_message(folder_uri, msg_id)
-            except Exception as e:
-                print(f"[fetch]   getMessage エラー ({msg_id[:20]}...): {e}")
-                continue
-
-            body = detail.get("body", "") if isinstance(detail, dict) else ""
-            if not is_job_mail(subject, body):
-                continue
-
-            messages.append({
-                "message_id": msg_id,
-                "subject":    subject,
-                "sender":     detail.get("author", "") if isinstance(detail, dict) else "",
-                "date_val":   detail.get("date")       if isinstance(detail, dict) else None,
-                "body":       body,
-            })
+        messages.append({
+            "message_id":  message_id,
+            "subject":     subject,
+            "sender_name": detail.get("from_name", "") or "",
+            "sender_addr": detail.get("from_address", "") or "",
+            "received_at": detail.get("received_at", ""),
+            "body":        body,
+        })
 
     return messages
 
@@ -243,22 +232,16 @@ def normalize_subject(subject: str) -> str:
     return s.strip()
 
 
-def is_job_mail(subject: str, body: str) -> bool:
-    # 要員紹介メール（案件ではなく人材売込み）を除外
-    exclude_patterns = [
-        "要員のご紹介", "ご紹介です！", "人材のご紹介",
-        "経歴書（スキルシート）", "スキルシート添付", "ご送付依頼",
-    ]
-    for pat in exclude_patterns:
-        if pat in subject:
-            return False
+def is_excluded_subject(subject: str) -> bool:
+    """要員紹介メール（案件ではなく人材売込み）を件名だけで判定して除外する"""
+    return any(pat in subject for pat in EXCLUDE_SUBJECT_PATTERNS)
 
-    keywords = [
-        "案件", "エンジニア募集", "Java", "SpringBoot", "springboot", "spring",
-        "必須", "尚可", "単価", "面談",
-    ]
+
+def is_job_mail(subject: str, body: str) -> bool:
+    if is_excluded_subject(subject):
+        return False
     text = subject + body
-    return sum(1 for k in keywords if k in text) >= 2
+    return sum(1 for k in JOB_KEYWORDS if k in text) >= 2
 
 
 # ───────────────────────────────────────
@@ -335,19 +318,14 @@ def analyze_with_claude(body: str) -> dict:
 # ユーティリティ
 # ───────────────────────────────────────
 
-def parse_sender(sender_raw: str) -> tuple[str, str]:
-    m = re.match(r'^(.*?)\s*<(.+?)>$', sender_raw.strip())
-    if m:
-        return m.group(1).strip().strip('"'), m.group(2).strip()
-    return "", sender_raw.strip()
-
-
-def parse_date(date_val) -> str:
-    if not date_val:
+def parse_received_at(value: str) -> str:
+    """APIの 'YYYY-MM-DD HH:MM:SS' 形式をISO8601形式に変換する"""
+    if not value:
         return datetime.now().isoformat()
-    if isinstance(date_val, (int, float)):
-        return datetime.fromtimestamp(date_val / 1000).isoformat()
-    return str(date_val)
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").isoformat()
+    except ValueError:
+        return str(value)
 
 
 # ───────────────────────────────────────
@@ -356,11 +334,11 @@ def parse_date(date_val) -> str:
 
 def run(days_back: int = FETCH_DAYS):
     db.init_db()
-    print(f"\n[fetch_mails] 取込開始 (過去{days_back}日 / Thunderbird MCP HTTP経由)")
+    print(f"\n[fetch_mails] 取込開始 (過去{days_back}日 / 案件メールAPI経由)")
 
     try:
         messages = fetch_messages(days_back)
-    except FileNotFoundError as e:
+    except ValueError as e:
         print(f"[ERROR] {e}")
         sys.exit(1)
 
@@ -382,13 +360,12 @@ def run(days_back: int = FETCH_DAYS):
             error_count += 1
             continue
 
-        sender_name, sender_email = parse_sender(m["sender"])
         row = {
             "message_id":       mid,
-            "received_at":      parse_date(m["date_val"]),
+            "received_at":      parse_received_at(m["received_at"]),
             "subject":          m["subject"],
-            "sender_email":     sender_email,
-            "sender_name":      sender_name,
+            "sender_email":     m["sender_addr"],
+            "sender_name":      m["sender_name"],
             "raw_body":         m["body"],
             "job_name":         result.get("job_name"),
             "client_company":   result.get("client_company"),
@@ -425,12 +402,15 @@ def run(days_back: int = FETCH_DAYS):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SES案件メール取込バッチ (Thunderbird MCP HTTP)")
+    parser = argparse.ArgumentParser(description="SES案件メール取込バッチ (案件メールAPI経由)")
     parser.add_argument("--days", type=int, default=FETCH_DAYS, help="取込日数（デフォルト7）")
     args = parser.parse_args()
 
     if not ANTHROPIC_API_KEY:
         print("[ERROR] ANTHROPIC_API_KEY が未設定です。.env を確認してください。")
+        sys.exit(1)
+    if not ANKEN_MAIL_API_TOKEN:
+        print("[ERROR] ANKEN_MAIL_API_TOKEN が未設定です。.env を確認してください。")
         sys.exit(1)
 
     run(args.days)
